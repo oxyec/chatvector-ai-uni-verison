@@ -347,13 +347,11 @@ class SQLAlchemyService(DatabaseService):
                             session, doc_id, query_embedding, match_count
                         )
                     else:
-                        vector_matches, keyword_matches = await asyncio.gather(
-                            self._find_vector_chunks(
-                                session, doc_id, query_embedding, candidate_limit
-                            ),
-                            self._find_keyword_chunks(
-                                session, doc_id, query_text.strip(), candidate_limit
-                            ),
+                        vector_matches = await self._find_vector_chunks(
+                            session, doc_id, query_embedding, candidate_limit
+                        )
+                        keyword_matches = await self._find_keyword_chunks(
+                            session, doc_id, query_text.strip(), candidate_limit
                         )
                         matches_by_id: dict[str, ChunkMatch] = {}
                         for match in vector_matches + keyword_matches:
