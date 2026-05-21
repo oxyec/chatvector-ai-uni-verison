@@ -128,6 +128,7 @@ async def _retrieve_chunks_for_documents(
     query_embedding: list[float],
     match_count: int,
     session_id: Optional[str] = None,
+    query_text: Optional[str] = None,
 ) -> list:
     retrieval_semaphore = _get_retrieval_semaphore()
 
@@ -138,6 +139,7 @@ async def _retrieve_chunks_for_documents(
                 query_embedding=query_embedding,
                 match_count=match_count,
                 session_id=session_id,
+                query_text=query_text,
             )
 
     per_document_chunks = await asyncio.gather(
@@ -192,6 +194,7 @@ async def answer_question_for_document(
             query_embedding=query_embedding,
             match_count=match_count,
             session_id=session_id,
+            query_text=question,
         )
         for chunk in chunks:
             key = (chunk.document_id, chunk.chunk_index)
@@ -199,9 +202,20 @@ async def answer_question_for_document(
                 seen_chunk_keys.add(key)
                 all_chunks.append(chunk)
     matching_chunks = await _finalize_retrieved_chunks(question, all_chunks, match_count)
+    if session_id:
+        import db
+        try:
+            history = await db.get_session_history(
+                session_id=session_id, limit=config.MAX_SESSION_HISTORY_MESSAGES, tenant_id=tenant_id
+            )
+            if not session_context:
+                session_context = SessionContext()
+            session_context.chat_history = history
+        except Exception as e:
+            logger.error(f"Failed to load chat history for session {session_id}: {e}", exc_info=True)
+
     context = build_context_from_chunks(matching_chunks, session_context=session_context)
     answer = await generate_answer(question, context)
-
     base: dict = {
         "question": question,
         "doc_id": doc_id,
@@ -219,6 +233,19 @@ async def answer_question_for_document(
         }
 
     logger.info(f"Answer generated successfully for document {doc_id}")
+
+    if session_id:
+        try:
+            import db
+            await db.store_chat_message(
+                session_id=session_id, role="user", content=question, tenant_id=tenant_id
+            )
+            await db.store_chat_message(
+                session_id=session_id, role="assistant", content=answer, tenant_id=tenant_id
+            )
+        except Exception as e:
+            logger.error(f"Failed to store chat messages for session {session_id}: {e}", exc_info=True)
+
     return {
         **base,
         "status": "ok",
@@ -230,6 +257,7 @@ async def answer_question_stream_for_document(
     doc_id: str,
     match_count: int = 5,
     auth: Optional[AuthContext] = None,
+    session_id: Optional[str] = None,
     session_context: Optional[SessionContext] = None,
 ) -> AsyncGenerator[str, None]:
     """
@@ -249,6 +277,7 @@ async def answer_question_stream_for_document(
                 doc_ids=[doc_id],
                 query_embedding=query_embedding,
                 match_count=match_count,
+                query_text=question,
             )
             for chunk in chunks:
                 key = (chunk.document_id, chunk.chunk_index)
@@ -256,17 +285,45 @@ async def answer_question_stream_for_document(
                     seen_chunk_keys.add(key)
                     all_chunks.append(chunk)
         matching_chunks = await _finalize_retrieved_chunks(question, all_chunks, match_count)
+        
+        if session_id:
+            import db
+            try:
+                history = await db.get_session_history(
+                    session_id=session_id, limit=config.MAX_SESSION_HISTORY_MESSAGES, tenant_id=tenant_id
+                )
+                if not session_context:
+                    session_context = SessionContext()
+                session_context.chat_history = history
+            except Exception as e:
+                logger.error(f"Failed to load chat history for session {session_id}: {e}", exc_info=True)
+            
         context = build_context_from_chunks(matching_chunks, session_context=session_context)
 
+        full_answer_chunks: list[str] = []
         async for chunk in generate_answer_stream(question, context):
             err = _structured_error_from_llm_answer(chunk)
             if err is not None:
                 yield f"event: error\ndata: {json.dumps(err['message'])}\n\n"
                 return
+            full_answer_chunks.append(chunk)
             yield f"event: token\ndata: {json.dumps(chunk)}\n\n"
 
         yield "event: done\ndata: [DONE]\n\n"
         logger.info(f"Answer stream generated successfully for document {doc_id}")
+
+        if session_id:
+            try:
+                import db
+                full_answer = "".join(full_answer_chunks)
+                await db.store_chat_message(
+                    session_id=session_id, role="user", content=question, tenant_id=tenant_id
+                )
+                await db.store_chat_message(
+                    session_id=session_id, role="assistant", content=full_answer, tenant_id=tenant_id
+                )
+            except Exception as e:
+                logger.error(f"Failed to store streaming chat messages for session {session_id}: {e}", exc_info=True)
 
     except Exception as e:
         logger.error(f"Stream failed for document {doc_id}: {e}", exc_info=True)
@@ -365,6 +422,7 @@ async def answer_questions_for_documents_batch(
                     query_embedding=query_embedding,
                     match_count=query["match_count"],
                     session_id=session_id,
+                    query_text=query["question"],
                 )
                 for chunk in chunks:
                     key = (chunk.document_id, chunk.chunk_index)
@@ -374,7 +432,21 @@ async def answer_questions_for_documents_batch(
             matching_chunks = await _finalize_retrieved_chunks(
                 query["question"], all_chunks, query["match_count"]
             )
-            context = build_context_from_chunks(matching_chunks, session_context=session_context)
+            
+            query_session_context = session_context
+            if session_id:
+                import db
+                try:
+                    history = await db.get_session_history(
+                        session_id=session_id, limit=config.MAX_SESSION_HISTORY_MESSAGES, tenant_id=tenant_id
+                    )
+                    from copy import deepcopy
+                    query_session_context = deepcopy(session_context) if session_context else SessionContext()
+                    query_session_context.chat_history = history
+                except Exception as e:
+                    logger.error(f"Failed to load batch chat history for session {session_id}: {e}", exc_info=True)
+                
+            context = build_context_from_chunks(matching_chunks, session_context=query_session_context)
             answer = await generate_answer(query["question"], context)
 
             sources = _build_sources(matching_chunks)
@@ -390,6 +462,18 @@ async def answer_questions_for_documents_batch(
                     "error": llm_err,
                     "session_id": session_id,
                 }
+
+            if session_id:
+                try:
+                    import db
+                    await db.store_chat_message(
+                        session_id=session_id, role="user", content=query["question"], tenant_id=tenant_id
+                    )
+                    await db.store_chat_message(
+                        session_id=session_id, role="assistant", content=answer, tenant_id=tenant_id
+                    )
+                except Exception as e:
+                    logger.error(f"Failed to store batch chat messages for session {session_id}: {e}", exc_info=True)
 
             return {
                 "status": "ok",
