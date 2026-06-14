@@ -16,6 +16,7 @@ export type UploadModalAttachment = {
   stage?: string;
   chunks?: { total: number; processed: number };
   processingTime?: string;
+  errorMessage?: string;
 };
 
 type Props = {
@@ -264,6 +265,7 @@ export default function UploadModal({
                   currentStage={showUploading ? "uploading" : attachment?.stage}
                   failed={showServerFailed}
                   chunks={attachment?.chunks}
+                  errorMessage={attachment?.errorMessage}
                   onDisplayedStageChange={(s) => {
                     if (s === "completed") setPipelineVisuallyComplete(true);
                   }}
@@ -328,12 +330,14 @@ export default function UploadModal({
                     >
                       {lastFile?.name ?? "Document"}
                     </p>
-                    <Loader2
-                      size={28}
-                      className="animate-spin text-muted"
-                      strokeWidth={2}
-                      aria-hidden
-                    />
+                    {!showServerFailed && (
+                      <Loader2
+                        size={28}
+                        className="animate-spin text-muted"
+                        strokeWidth={2}
+                        aria-hidden
+                      />
+                    )} 
                   </>
                 )}
               </div>
